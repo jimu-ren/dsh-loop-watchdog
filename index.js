@@ -1,42 +1,43 @@
 /**
- * @local/loop-watchdog — DeepSeek Harness host plugin.
+ * dsh-loop-watchdog — DeepSeek Harness host plugin.
  *
- * Problem: an agent can get stuck in a long turn where it keeps "thinking"
- * without producing any new visible output (a dead loop), burning tokens until
- * it either never finishes or the user has to interrupt manually.
+ * Detects dead loops: a running agent with a long turn producing no output at
+ * all. Every durable activity signal resets a stall timer; if the timer
+ * expires, the plugin cancels the stuck turn and wakes the agent with a
+ * follow-up telling it to change strategy and continue. Repeats while the
+ * agent stays stuck (the counter resets on real progress), and gives up per
+ * agent after `maxRecoveries` consecutive stalls so the plugin itself cannot
+ * loop forever.
  *
- * Behaviour: while an agent is running, every durable activity signal resets a
- * stall timer (assistant stream frames, tool executions, step/turn boundaries,
- * errors, status changes). If no activity arrives for `stallMs`, the plugin
- * cancels the stuck turn and wakes the agent with a user follow-up that tells
- * it to stop spinning, switch strategy, and keep working. It repeats this up to
- * `maxRecoveries` times per agent, then stops and logs so it cannot itself loop
- * forever.
+ * Event-mode contract (this is what broke the first release):
+ * - WATERFALL listeners (`agent/pre-step`, `agent/request-error`,
+ *   `tools/pre-execute`, `tools/post-execute`, `tools/execute`) MUST return
+ *   `next()`; returning undefined breaks the decision chain and the loop
+ *   later reads `.kind` on undefined.
+ * - Emit/serial listeners may return nothing.
+ * - `tools/*` events are scoped to the tools service, not to the agent, so
+ *   they are registered on the root context and matched through
+ *   `exec.agent`; agent-scoped events are registered on `agent.ctx`.
  *
- * This is a Host-only bundle: the row is inserted by cordis.patch.yml and this
- * module only registers lifecycle hooks.
- *
- * NOTE: this bundle is linked to a real directory outside the profile's
- * node_modules, so Node cannot resolve bare `@deepseek-ai/*` specifiers from
- * here. The plugin therefore uses no bare runtime imports and builds the
- * follow-up message from its plain object shape directly.
+ * This bundle is linked outside the profile node_modules, so it must not
+ * import bare `@deepseek-ai/*` specifiers; the follow-up message is built
+ * from its plain durable shape directly (source.kind is required by the
+ * inbox validation).
  */
 
 import { randomUUID } from 'node:crypto'
 
-/** Default configuration; merged with whatever the patch row supplies. */
 const DEFAULTS = Object.freeze({
   enabled: true,
   /** Milliseconds of complete silence before a turn is treated as a dead loop. */
   stallMs: 90000,
-  /** Hard cap of auto-breaks per agent. After this the plugin logs and stops. */
+  /** Consecutive stall breaks per agent; real progress resets the counter. */
   maxRecoveries: 3,
   /** The follow-up text injected to make the agent change strategy and continue. */
   recoveryPrompt:
-    '检测到当前回合已经长时间没有产生任何新的输出，已经自动中断这次循环。请立即停止原地打转，换一个与之前不同的思路或方案继续推进任务；如果需要用户决策，就明确提问，不要再重复此前无效的路径。继续完成任务，不要结束回合。',
+    '检测到当前回合已经长时间没有产生任何新的输出，已自动中断这次循环。请停止原地打转，换一个不同的思路或方案继续推进任务；若需要用户决策，请明确提出问题；继续完成任务。',
 })
 
-/** Normalize the row config over the defaults. */
 function resolveConfig(input) {
   return {
     enabled: input?.enabled ?? DEFAULTS.enabled,
@@ -46,85 +47,7 @@ function resolveConfig(input) {
   }
 }
 
-/** Per-agent watchdog bookkeeping. */
-const entries = new Map()
-
-function clearTimer(entry) {
-  if (entry.timer !== null) {
-    clearTimeout(entry.timer)
-    entry.timer = null
-  }
-}
-
-/** Re-arm the stall timer for a running agent. */
-function armTimer(entry, config) {
-  clearTimer(entry)
-  if (entry.disposed) return
-  entry.timer = setTimeout(() => {
-    entry.timer = null
-    fire(entry, config)
-  }, config.stallMs)
-  // Never hold the process open just for the watchdog.
-  entry.timer.unref?.()
-}
-
-/** Record activity and (while running) keep the timer armed. */
-function touch(entry, config) {
-  if (entry.disposed) return
-  entry.lastActivity = Date.now()
-  if (entry.agent.status === 'running') armTimer(entry, config)
-}
-
-/**
- * Real progress means the agent is not stuck. Reset the consecutive-stall
- * count so a later stall episode can be recovered again — the watchdog keeps
- * working until the task actually finishes, and only stops when the agent is
- * repeatedly stuck back-to-back.
- */
-function markProgress(entry) {
-  if (entry.disposed || entry.recoveries === 0) return
-  entry.logger.info(`agent ${String(entry.agent.id)} made progress; reset recovery counter`)
-  entry.recoveries = 0
-}
-
-/** Break a stuck turn: cancel, then wake with a strategy-changing follow-up. */
-function fire(entry, config) {
-  const { agent } = entry
-  if (entry.disposed || entry.disabled) return
-  if (agent.status !== 'running') return
-  if (entry.recoveries >= config.maxRecoveries) {
-    entry.logger.warn(
-      `agent ${String(agent.id)} still silent after ${entry.recoveries} recoveries; giving up on this agent`,
-    )
-    entry.disabled = true
-    return
-  }
-  entry.recoveries += 1
-  const seq = entry.recoveries
-  entry.logger.warn(
-    `agent ${String(agent.id)} produced no output for ${config.stallMs}ms; breaking the loop (recovery ${seq}/${config.maxRecoveries})`,
-  )
-
-  try {
-    // Abort the stuck turn first so the agent actually exits the loop.
-    agent.cancel({ kind: 'hook', reason: 'loop-watchdog' })
-  } catch (error) {
-    entry.logger.warn(`agent ${String(agent.id)} cancel failed: ${String(error?.message ?? error)}`)
-  }
-
-  // Wake the driver on the next turn with the recovery instruction.
-  const wake = setTimeout(() => {
-    if (entry.disposed || entry.disabled) return
-    try {
-      entry.agent.followup(makeUserMessage(config.recoveryPrompt))
-    } catch (error) {
-      entry.logger.warn(`agent ${String(agent.id)} followup failed: ${String(error?.message ?? error)}`)
-    }
-  }, 100)
-  wake.unref?.()
-}
-
-/** Build a valid user message from its plain object shape (no bare imports). */
+/** Build a valid durable user message (source.kind is load-bearing). */
 function makeUserMessage(text) {
   return {
     id: randomUUID(),
@@ -145,13 +68,101 @@ export function apply(ctx, rawConfig) {
     log.info('loop-watchdog disabled by configuration')
     return
   }
-  log.info(`loop-watchdog enabled: stallMs=${config.stallMs} maxRecoveries=${config.maxRecoveries}`)
+  log.info(`loop-watchdog v1.0.1 enabled: stallMs=${config.stallMs} maxRecoveries=${config.maxRecoveries}`)
 
+  /** Per-agent watchdog bookkeeping, keyed by agent id. */
+  const entries = new Map()
+
+  function clearTimer(entry) {
+    if (entry?.timer) {
+      clearTimeout(entry.timer)
+      entry.timer = null
+    }
+  }
+
+  function armTimer(entry) {
+    clearTimer(entry)
+    if (entry.disposed || entry.disabled) return
+    entry.timer = setTimeout(() => {
+      entry.timer = null
+      try {
+        fire(entry)
+      } catch (error) {
+        log.warn(`fire failed: ${String(error?.message ?? error)}`)
+      }
+    }, config.stallMs)
+    entry.timer.unref?.()
+  }
+
+  function touch(entry) {
+    if (!entry || entry.disposed) return
+    entry.lastActivity = Date.now()
+    if (entry.agent.status === 'running') armTimer(entry)
+  }
+
+  /** Any observable activity: re-arm the stall timer. */
+  function activity(agent) {
+    touch(entries.get(agent?.id))
+  }
+
+  /** Real progress (streamed text, admitted step, tool result): also reset the stall counter. */
+  function progress(agent) {
+    const entry = entries.get(agent?.id)
+    if (!entry || entry.disposed) return
+    touch(entry)
+    if (entry.recoveries !== 0) {
+      log.info(`agent ${String(agent.id)} made progress; recovery counter reset`)
+      entry.recoveries = 0
+    }
+  }
+
+  function dispose(agent) {
+    const entry = entries.get(agent?.id)
+    if (!entry) return
+    entry.disposed = true
+    clearTimer(entry)
+    entries.delete(agent.id)
+  }
+
+  /** Break a stuck turn: cancel it, then wake the driver with the recovery follow-up. */
+  function fire(entry) {
+    const { agent } = entry
+    if (entry.disposed || entry.disabled) return
+    if (agent.status !== 'running') return
+    if (entry.recoveries >= config.maxRecoveries) {
+      log.warn(
+        `agent ${String(agent.id)} still silent after ${entry.recoveries} recoveries; watchdog stands down for this agent`,
+      )
+      entry.disabled = true
+      return
+    }
+    entry.recoveries += 1
+    log.warn(
+      `agent ${String(agent.id)} produced no output for ${config.stallMs}ms; breaking the loop (recovery ${entry.recoveries}/${config.maxRecoveries})`,
+    )
+
+    try {
+      agent.cancel({ kind: 'hook', reason: 'loop-watchdog' })
+    } catch (error) {
+      log.warn(`agent ${String(agent.id)} cancel failed: ${String(error?.message ?? error)}`)
+      return
+    }
+
+    const wake = setTimeout(() => {
+      if (entry.disposed || entry.disabled) return
+      try {
+        entry.agent.followup(makeUserMessage(config.recoveryPrompt))
+      } catch (error) {
+        log.warn(`agent ${String(agent.id)} followup failed: ${String(error?.message ?? error)}`)
+      }
+    }, 150)
+    wake.unref?.()
+  }
+
+  // ── per-agent lifecycle ─────────────────────────────────────────────────
   ctx.on('agent/created', ({ agent }) => {
     const entry = {
       agent,
-      config,
-      logger: log,
       timer: null,
       lastActivity: Date.now(),
       recoveries: 0,
@@ -160,47 +171,36 @@ export function apply(ctx, rawConfig) {
     }
     entries.set(agent.id, entry)
 
-    const onActivity = () => touch(entry, config)
-    const onProgress = () => {
-      touch(entry, config)
-      markProgress(entry)
-    }
-    const onStatus = ({ status }) => {
-      if (status === 'running') {
-        touch(entry, config)
-      } else {
-        clearTimer(entry)
-      }
-    }
-    const onDisposed = ({ agent: disposedAgent }) => {
-      if (disposedAgent.id !== agent.id) return
-      entry.disposed = true
-      clearTimer(entry)
-      entries.delete(agent.id)
-    }
+    // Scoped<Agent> emit/serial listeners: returning nothing is fine.
+    agent.ctx.on('agent/status', ({ status }) => {
+      if (status === 'running') touch(entry)
+      else clearTimer(entry)
+    })
+    agent.ctx.on('agent/assistant-stream', () => progress(agent))
+    agent.ctx.on('agent/error', () => activity(agent))
+    agent.ctx.on('agent/inbox/claimed', () => activity(agent))
 
-    agent.ctx.on('agent/status', onStatus)
-    agent.ctx.on('agent/assistant-stream', onProgress)
-    agent.ctx.on('agent/pre-step', onProgress)
-    agent.ctx.on('agent/turn-ending', onProgress)
-    agent.ctx.on('agent/turn-stopping', onActivity)
-    agent.ctx.on('agent/error', onActivity)
-    agent.ctx.on('agent/request-error', onActivity)
-    agent.ctx.on('tools/execute', onActivity)
-    agent.ctx.on('tools/result', onProgress)
-    agent.ctx.on('tools/post-execute', onActivity)
-    agent.ctx.on('agent/disposed', onDisposed)
-
-    // If the agent is already running when it appears, arm immediately.
-    if (agent.status === 'running') touch(entry, config)
+    // Scoped<Agent> WATERFALL listeners: must delegate and return next().
+    agent.ctx.on('agent/pre-step', (_payload, next) => {
+      progress(agent)
+      return next()
+    })
+    agent.ctx.on('agent/request-error', (_payload, next) => {
+      activity(agent)
+      return next()
+    })
   })
 
-  ctx.on('agent/disposed', ({ agent }) => {
-    const entry = entries.get(agent.id)
-    if (entry) {
-      entry.disposed = true
-      clearTimer(entry)
-      entries.delete(agent.id)
-    }
+  ctx.on('agent/disposed', ({ agent }) => dispose(agent))
+
+  // ── tools events are service-scoped: register on root, match by exec.agent ─
+  // WATERFALL: return next() so the dispatch decision survives.
+  ctx.on('tools/pre-execute', (exec, next) => {
+    if (exec?.agent) activity(exec.agent)
+    return next()
+  })
+  // emit: observe the frozen result; this is real progress.
+  ctx.on('tools/result', (exec) => {
+    if (exec?.agent) progress(exec.agent)
   })
 }
