@@ -62,9 +62,18 @@ strategy until the task is actually done.
 | 键 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `true` | 总开关，设为 `false` 即完全停用。 |
-| `stallMs` | number | `90000` | 完全静默多久（毫秒）判定为死循环。 |
-| `maxRecoveries` | number | `3` | 连续卡死的最大打断次数。 |
+| `stallMs` | number | `30000` | 完全无任何活动多久（毫秒）判定为死循环。 |
+| `thinkingStallMs` | number | `45000` | 只有内部思考（reasoning）而无正文/工具活动时，多久判定为空转。 |
+| `maxRecoveries` | number | `0`（不限） | 连续打断次数上限；出现可见进展即清零。`0` 表示不限次数，直到任务完成。 |
 | `recoveryPrompt` | string | 见 `index.js` | 唤醒时注入的提示语。 |
+
+## 分级检测（v1.0.2）
+
+- **可见进展**（正文流式输出、工具执行/结果、新步骤）→ 重置全部计时器与计数器。
+- **只有思考输出**（reasoning-delta 持续、无正文）→ 仅重置 `thinkingStallMs` 短计时器；
+  长时间纯思考同样会被判定空转并打断。
+- **完全静默** → `stallMs` 后打断。
+- 打断次数默认**不限**，只要任务还在跑且反复卡死，看门狗就持续介入，直到出现真实进展或回合自然结束。
 
 ## 重要提示 / Important
 

@@ -1,47 +1,50 @@
 /**
  * dsh-loop-watchdog — DeepSeek Harness host plugin.
  *
- * Detects dead loops: a running agent with a long turn producing no output at
- * all. Every durable activity signal resets a stall timer; if the timer
- * expires, the plugin cancels the stuck turn and wakes the agent with a
- * follow-up telling it to change strategy and continue. Repeats while the
- * agent stays stuck (the counter resets on real progress), and gives up per
- * agent after `maxRecoveries` consecutive stalls so the plugin itself cannot
- * loop forever.
+ * Detects dead loops: a running agent whose turn makes no real progress.
+ * Three activity tiers drive two timers:
+ * - VISIBLE progress (正文 text-delta, tool execution/results, new admitted
+ *   steps) resets the stall timer AND the recovery counter — the task moved.
+ * - REASONING output (chain-of-thought text with no visible body) resets only
+ *   the shorter `thinkingStallMs` timer: pure silent thinking is kept alive
+ *   briefly, but a long reasoning-only stretch counts as stuck and is broken.
+ * - Nothing at all for `stallMs` is definitely stuck.
+ * On a stall the plugin cancels the turn and wakes the agent with a recovery
+ * follow-up. Recovery attempts are UNLIMITED (maxRecoveries=0 means no cap):
+ * the watchdog keeps breaking loops until the task actually finishes or the
+ * agent goes idle.
  *
  * Event-mode contract (this is what broke the first release):
  * - WATERFALL listeners (`agent/pre-step`, `agent/request-error`,
- *   `tools/pre-execute`, `tools/post-execute`, `tools/execute`) MUST return
- *   `next()`; returning undefined breaks the decision chain and the loop
- *   later reads `.kind` on undefined.
- * - Emit/serial listeners may return nothing.
- * - `tools/*` events are scoped to the tools service, not to the agent, so
- *   they are registered on the root context and matched through
- *   `exec.agent`; agent-scoped events are registered on `agent.ctx`.
+ *   `tools/pre-execute`, `tools/post-execute`) MUST return `next()`.
+ * - `tools/*` events are scoped to the tools service, not to the agent: they
+ *   are registered on the root context and matched through `exec.agent`.
  *
  * This bundle is linked outside the profile node_modules, so it must not
  * import bare `@deepseek-ai/*` specifiers; the follow-up message is built
- * from its plain durable shape directly (source.kind is required by the
- * inbox validation).
+ * from its plain durable shape directly (source.kind is load-bearing).
  */
 
 import { randomUUID } from 'node:crypto'
 
 const DEFAULTS = Object.freeze({
   enabled: true,
-  /** Milliseconds of complete silence before a turn is treated as a dead loop. */
-  stallMs: 90000,
-  /** Consecutive stall breaks per agent; real progress resets the counter. */
-  maxRecoveries: 3,
+  /** Milliseconds with no activity of any kind before the turn is broken. */
+  stallMs: 30000,
+  /** Milliseconds of reasoning-only output before the turn is broken. */
+  thinkingStallMs: 45000,
+  /** Consecutive breaks per agent before standing down; 0 means unlimited. */
+  maxRecoveries: 0,
   /** The follow-up text injected to make the agent change strategy and continue. */
   recoveryPrompt:
-    '检测到当前回合已经长时间没有产生任何新的输出，已自动中断这次循环。请停止原地打转，换一个不同的思路或方案继续推进任务；若需要用户决策，请明确提出问题；继续完成任务。',
+    '检测到当前回合长时间没有产生有效的可见进展（只有内部思考在空转或完全静默），已自动中断这次循环。请停止原地打转，立即换一个不同的思路或方案：直接动手执行下一步（调用工具、给出正文结论），或把问题拆小后先完成其中一小块；若确实需要用户决策，请明确提出问题。继续完成任务，不要只停留在思考里。',
 })
 
 function resolveConfig(input) {
   return {
     enabled: input?.enabled ?? DEFAULTS.enabled,
     stallMs: input?.stallMs ?? DEFAULTS.stallMs,
+    thinkingStallMs: input?.thinkingStallMs ?? DEFAULTS.thinkingStallMs,
     maxRecoveries: input?.maxRecoveries ?? DEFAULTS.maxRecoveries,
     recoveryPrompt: input?.recoveryPrompt ?? DEFAULTS.recoveryPrompt,
   }
@@ -68,77 +71,124 @@ export function apply(ctx, rawConfig) {
     log.info('loop-watchdog disabled by configuration')
     return
   }
-  log.info(`loop-watchdog v1.0.1 enabled: stallMs=${config.stallMs} maxRecoveries=${config.maxRecoveries}`)
+  log.info(
+    `loop-watchdog v1.0.2 enabled: stallMs=${config.stallMs} thinkingStallMs=${config.thinkingStallMs} `
+    + `maxRecoveries=${config.maxRecoveries === 0 ? 'unlimited' : config.maxRecoveries}`,
+  )
 
   /** Per-agent watchdog bookkeeping, keyed by agent id. */
   const entries = new Map()
 
-  function clearTimer(entry) {
-    if (entry?.timer) {
+  function clearTimers(entry) {
+    if (entry.timer) {
       clearTimeout(entry.timer)
       entry.timer = null
     }
+    if (entry.thinkTimer) {
+      clearTimeout(entry.thinkTimer)
+      entry.thinkTimer = null
+    }
   }
 
-  function armTimer(entry) {
-    clearTimer(entry)
-    if (entry.disposed || entry.disabled) return
-    entry.timer = setTimeout(() => {
-      entry.timer = null
+  function fireSoon(entry, reason) {
+    entry.pendingReason = reason
+    const wake = setTimeout(() => {
       try {
         fire(entry)
       } catch (error) {
         log.warn(`fire failed: ${String(error?.message ?? error)}`)
       }
+    }, 0)
+    wake.unref?.()
+  }
+
+  /** Arm both tier timers; each fires only while it is still expired first. */
+  function armTimers(entry) {
+    clearTimers(entry)
+    if (entry.disposed) return
+    entry.timer = setTimeout(() => {
+      entry.timer = null
+      if (entry.thinkTimer !== null) { clearTimeout(entry.thinkTimer); entry.thinkTimer = null }
+      fireSoon(entry, 'no activity at all')
     }, config.stallMs)
     entry.timer.unref?.()
+    if (entry.reasoningOnly) {
+      entry.thinkTimer = setTimeout(() => {
+        entry.thinkTimer = null
+        if (entry.timer !== null) { clearTimeout(entry.timer); entry.timer = null }
+        fireSoon(entry, 'reasoning only, no visible output')
+      }, config.thinkingStallMs)
+      entry.thinkTimer.unref?.()
+    }
   }
 
-  function touch(entry) {
-    if (!entry || entry.disposed) return
-    entry.lastActivity = Date.now()
-    if (entry.agent.status === 'running') armTimer(entry)
-  }
-
-  /** Any observable activity: re-arm the stall timer. */
-  function activity(agent) {
-    touch(entries.get(agent?.id))
-  }
-
-  /** Real progress (streamed text, admitted step, tool result): also reset the stall counter. */
+  /** Visible progress: reset both timers and the consecutive-stall counter. */
   function progress(agent) {
     const entry = entries.get(agent?.id)
     if (!entry || entry.disposed) return
-    touch(entry)
+    entry.reasoningOnly = false
     if (entry.recoveries !== 0) {
-      log.info(`agent ${String(agent.id)} made progress; recovery counter reset`)
+      log.info(`agent ${String(agent.id)} made visible progress; recovery counter reset`)
       entry.recoveries = 0
     }
+    if (entry.agent.status === 'running') armTimers(entry)
+  }
+
+  /**
+   * Any stream frame. text-delta is progress; reasoning-delta and
+   * tool-call-delta keep the turn alive on the short tier only — reasoning
+   * with no body is exactly the spinning the watchdog must break.
+   */
+  function onStream(agent, frame) {
+    const entry = entries.get(agent?.id)
+    if (!entry || entry.disposed) return
+    const chunk = frame?.chunk
+    if (chunk?.type === 'text-delta') {
+      progress(agent)
+      return
+    }
+    if (chunk?.type === 'reasoning-delta') {
+      entry.reasoningOnly = true
+      if (entry.agent.status === 'running') armTimers(entry)
+      return
+    }
+    if (chunk?.type === 'tool-call-delta') {
+      // The call is being streamed; the eventual tools/result counts as progress.
+      entry.reasoningOnly = false
+      if (entry.agent.status === 'running') armTimers(entry)
+      return
+    }
+    if (frame?.type === 'end') {
+      // An attempt settled without visible text: keep the stall pressure on.
+      if (entry.agent.status === 'running') armTimers(entry)
+    }
+  }
+
+  /** Plain activity: keep the long timer alive without clearing the counter. */
+  function activity(agent) {
+    const entry = entries.get(agent?.id)
+    if (!entry || entry.disposed) return
+    if (entry.agent.status === 'running') armTimers(entry)
   }
 
   function dispose(agent) {
     const entry = entries.get(agent?.id)
     if (!entry) return
     entry.disposed = true
-    clearTimer(entry)
+    clearTimers(entry)
     entries.delete(agent.id)
   }
 
   /** Break a stuck turn: cancel it, then wake the driver with the recovery follow-up. */
   function fire(entry) {
     const { agent } = entry
-    if (entry.disposed || entry.disabled) return
+    if (entry.disposed) return
     if (agent.status !== 'running') return
-    if (entry.recoveries >= config.maxRecoveries) {
-      log.warn(
-        `agent ${String(agent.id)} still silent after ${entry.recoveries} recoveries; watchdog stands down for this agent`,
-      )
-      entry.disabled = true
-      return
-    }
+    entry.reasoningOnly = false
+    const reason = entry.pendingReason ?? 'stalled'
     entry.recoveries += 1
     log.warn(
-      `agent ${String(agent.id)} produced no output for ${config.stallMs}ms; breaking the loop (recovery ${entry.recoveries}/${config.maxRecoveries})`,
+      `agent ${String(agent.id)} loop detected (${reason}); breaking the turn (break #${entry.recoveries})`,
     )
 
     try {
@@ -149,7 +199,7 @@ export function apply(ctx, rawConfig) {
     }
 
     const wake = setTimeout(() => {
-      if (entry.disposed || entry.disabled) return
+      if (entry.disposed) return
       try {
         entry.agent.followup(makeUserMessage(config.recoveryPrompt))
       } catch (error) {
@@ -164,21 +214,26 @@ export function apply(ctx, rawConfig) {
     const entry = {
       agent,
       timer: null,
-      lastActivity: Date.now(),
+      thinkTimer: null,
+      reasoningOnly: false,
+      pendingReason: null,
       recoveries: 0,
-      disabled: false,
       disposed: false,
     }
     entries.set(agent.id, entry)
 
     // Scoped<Agent> emit/serial listeners: returning nothing is fine.
     agent.ctx.on('agent/status', ({ status }) => {
-      if (status === 'running') touch(entry)
-      else clearTimer(entry)
+      if (status === 'running') {
+        entry.reasoningOnly = false
+        armTimers(entry)
+      } else {
+        clearTimers(entry)
+      }
     })
-    agent.ctx.on('agent/assistant-stream', () => progress(agent))
+    agent.ctx.on('agent/assistant-stream', ({ frame }) => onStream(agent, frame))
     agent.ctx.on('agent/error', () => activity(agent))
-    agent.ctx.on('agent/inbox/claimed', () => activity(agent))
+    agent.ctx.on('agent/inbox/claimed', () => progress(agent))
 
     // Scoped<Agent> WATERFALL listeners: must delegate and return next().
     agent.ctx.on('agent/pre-step', (_payload, next) => {
@@ -196,7 +251,7 @@ export function apply(ctx, rawConfig) {
   // ── tools events are service-scoped: register on root, match by exec.agent ─
   // WATERFALL: return next() so the dispatch decision survives.
   ctx.on('tools/pre-execute', (exec, next) => {
-    if (exec?.agent) activity(exec.agent)
+    if (exec?.agent) progress(exec.agent)
     return next()
   })
   // emit: observe the frozen result; this is real progress.
