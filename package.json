@@ -1,6 +1,6 @@
 {
   "name": "dsh-loop-watchdog",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "DeepSeek Harness host plugin: detect long no-output (dead-loop) turns and auto-break them so the agent keeps thinking until the task is done.",
   "keywords": [
     "deepseek",

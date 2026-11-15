@@ -72,7 +72,7 @@ export function apply(ctx, rawConfig) {
     return
   }
   log.info(
-    `loop-watchdog v1.0.2 enabled: stallMs=${config.stallMs} thinkingStallMs=${config.thinkingStallMs} `
+    `loop-watchdog v1.0.3 enabled: stallMs=${config.stallMs} thinkingStallMs=${config.thinkingStallMs} `
     + `maxRecoveries=${config.maxRecoveries === 0 ? 'unlimited' : config.maxRecoveries}`,
   )
 
@@ -87,6 +87,49 @@ export function apply(ctx, rawConfig) {
     if (entry.thinkTimer) {
       clearTimeout(entry.thinkTimer)
       entry.thinkTimer = null
+    }
+  }
+
+  /**
+   * The agent is blocked waiting for the user (ask_user_question / approval
+   * dialog open). Silence here is legitimate; the watchdog must not count it
+   * as a stall. Nested waits are reference-counted.
+   */
+  function pauseForUser(entry) {
+    entry.waiting += 1
+    clearTimers(entry)
+  }
+
+  function resumeFromUser(entry) {
+    if (entry.waiting > 0) entry.waiting -= 1
+    if (entry.waiting === 0 && !entry.disposed && entry.agent.status === 'running') {
+      armTimers(entry)
+    }
+  }
+
+  /**
+   * Wrap one request-style waterfall event: freeze the watchdog for as long
+   * as the downstream answerer keeps the request pending (the awaited
+   * `next()` covers the whole user-wait window), then resume.
+   */
+  function userWaitListener(entry) {
+    return (_payload, next) => {
+      pauseForUser(entry)
+      let result
+      try {
+        result = next()
+      } catch (error) {
+        resumeFromUser(entry)
+        throw error
+      }
+      if (result && typeof result.then === 'function') {
+        return result.then(
+          (value) => { resumeFromUser(entry); return value },
+          (error) => { resumeFromUser(entry); throw error },
+        )
+      }
+      resumeFromUser(entry)
+      return result
     }
   }
 
@@ -105,7 +148,7 @@ export function apply(ctx, rawConfig) {
   /** Arm both tier timers; each fires only while it is still expired first. */
   function armTimers(entry) {
     clearTimers(entry)
-    if (entry.disposed) return
+    if (entry.disposed || entry.waiting > 0) return
     entry.timer = setTimeout(() => {
       entry.timer = null
       if (entry.thinkTimer !== null) { clearTimeout(entry.thinkTimer); entry.thinkTimer = null }
@@ -183,6 +226,7 @@ export function apply(ctx, rawConfig) {
   function fire(entry) {
     const { agent } = entry
     if (entry.disposed) return
+    if (entry.waiting > 0) return // user-wait window; the answer will re-arm us
     if (agent.status !== 'running') return
     entry.reasoningOnly = false
     const reason = entry.pendingReason ?? 'stalled'
@@ -218,6 +262,7 @@ export function apply(ctx, rawConfig) {
       reasoningOnly: false,
       pendingReason: null,
       recoveries: 0,
+      waiting: 0,
       disposed: false,
     }
     entries.set(agent.id, entry)
@@ -244,6 +289,11 @@ export function apply(ctx, rawConfig) {
       activity(agent)
       return next()
     })
+
+    // Ask-the-user and approval dialogs: watchdog is frozen while the user
+    // decides, and that wait never counts toward a stall.
+    agent.ctx.on('user-questions/request', userWaitListener(entry))
+    agent.ctx.on('approval/request', userWaitListener(entry))
   })
 
   ctx.on('agent/disposed', ({ agent }) => dispose(agent))

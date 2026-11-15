@@ -73,6 +73,8 @@ strategy until the task is actually done.
 - **只有思考输出**（reasoning-delta 持续、无正文）→ 仅重置 `thinkingStallMs` 短计时器；
   长时间纯思考同样会被判定空转并打断。
 - **完全静默** → `stallMs` 后打断。
+- **向用户等待（v1.0.3）**：插件提出选择题（ask_user_question）或权限审批弹窗时，
+  看门狗完全冻结，等待用户回答的时间不计入任何计时；收到答案后自动恢复检测。
 - 打断次数默认**不限**，只要任务还在跑且反复卡死，看门狗就持续介入，直到出现真实进展或回合自然结束。
 
 ## 重要提示 / Important
