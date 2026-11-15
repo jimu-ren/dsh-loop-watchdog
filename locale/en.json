@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Loop watchdog",
+    "description": "Detects long no-output turns and breaks the dead loop so the agent keeps working until the task is done.",
+    "detail": "Watches running agent activity. If no output or tool activity arrives for the configured stall time, it cancels the stuck turn and injects a follow-up that forces a change of strategy, repeating up to a per-agent cap."
+  }
+}

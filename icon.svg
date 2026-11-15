@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Loop watchdog">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2b6cb0"/>
+      <stop offset="1" stop-color="#1a497a"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#bg)"/>
+  <g fill="none" stroke="#e6f2ff" stroke-width="4.5" stroke-linecap="round">
+    <path d="M44 26a16 16 0 1 0 2 16" />
+    <path d="M46 14l4 4-4 4" />
+  </g>
+  <circle cx="30" cy="32" r="4.5" fill="#ffd166"/>
+</svg>

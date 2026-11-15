@@ -1,0 +1,4 @@
+- insert:
+    - id: loop-watchdog
+      name: 'dsh-loop-watchdog'
+      config: {}
