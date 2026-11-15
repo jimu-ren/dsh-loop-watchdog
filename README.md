@@ -1,52 +1,85 @@
 # dsh-loop-watchdog
 
-DeepSeek Harness 宿主插件：检测"长时间没有输出"的死循环回合，自动打断并唤醒
-agent 换方案继续思考，直到任务完成才停止。
+DeepSeek Harness 宿主插件：检测 agent 的"死循环"回合——长时间没有可见输出、
+只有内部思考在空转——自动打断并唤醒 agent 换方案继续，直到任务真正完成。
+等待用户回答提问/审批的时间不会被误判。
 
-A DeepSeek Harness host plugin that detects dead loops (long turns with no
-output), auto-breaks them, and wakes the agent to continue with a different
-strategy until the task is actually done.
+A DeepSeek Harness host plugin that detects dead-loop turns — long stretches
+with no visible output, or reasoning that spins without producing anything —
+breaks them automatically, wakes the agent with a change-of-strategy follow-up,
+and keeps doing this until the task is done. Time spent waiting on the user
+never counts as a stall.
 
 ## 功能 / Features
 
-- 为每个处于 `running` 的 agent 维护一个静默看门狗。
-- 任何真实活动（assistant 流式输出、工具执行与结果、步骤/回合边界、错误、
-  状态变化）都会重置静默计时器。
-- 超过 `stallMs` 仍无任何输出时：
-  1. 记录一条 warning 日志；
-  2. 调用 `agent.cancel({ kind: 'hook', reason: 'loop-watchdog' })` 退出卡死的回合；
-  3. 调用 `agent.followup(...)` 注入一条"停止原地打转、换方案继续"的提示并唤醒。
-- **连续**卡死达到 `maxRecoveries` 才停手；一旦出现真实进展，计数清零，因此会一直
-  兜底到任务完成，同时不会让自己陷入死循环。
-- 默认 90 秒静默判定、最多 3 次连续打断，可配置、可一键关闭。
+### 分级检测（两档计时）
 
-## 工作原理 / How it works
+- **可见进展**：正文流式输出（text-delta）、工具调用与结果、新步骤被准入
+  → 重置全部计时器与打断计数。
+- **只有内部思考在动**（reasoning-delta 持续、没有正文/工具活动）
+  → 只重置较短的 `thinkingStallMs`（默认 45 秒）计时器；长时间纯空转照样判定卡死并打断。
+- **完全静默**（思考带正文都没有）→ `stallMs`（默认 30 秒）后打断。
 
-插件是一个 Host-only bundle：`cordis.patch.yml` 插入一行，`apply(ctx, config)`
-在 `agent/created` 时为该 agent 注册看门狗，并订阅其 `ctx` 上的活动事件。定时器使用
-`unref()`，不会因为看门狗而让进程保持运行。
+### 打断与唤醒
+
+超时判定为死循环后：
+
+1. 记录一条 warning 日志（logger 名 `loop-watchdog`）；
+2. `agent.cancel({ kind: 'hook', reason: 'loop-watchdog' })` 中断卡死回合；
+3. `agent.followup(...)` 注入一条提示，要求 agent 停止原地打转、直接动手执行
+   下一步（调用工具 / 给出正文结论 / 拆分任务），并继续完成任务。
+
+### 等待用户时完全冻结（v1.0.3）
+
+agent 提出选择题（`ask_user_question`）或弹出权限审批（`approval/request`）时，
+看门狗冻结全部计时——用户想多久答都行，这段等待**不计入**卡顿判定。收到回答后
+自动恢复检测。支持提问与审批叠加（引用计数）。
+
+### 不限次数，直到完成
+
+打断次数默认**不限**（`maxRecoveries = 0`）。只要出现可见进展，计数即清零；
+若你希望恢复"连续 N 次无进展就停手"的保护，把 `maxRecoveries` 配成正整数即可。
+
+## 配置 / Config
+
+通过 bundle 行的 `config` 传入（`cordis.patch.yml`）：
+
+| 键 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `true` | 总开关，设为 `false` 即完全停用。 |
+| `stallMs` | number | `30000` | 完全无任何活动多久（毫秒）判定为死循环。 |
+| `thinkingStallMs` | number | `45000` | 只有内部思考而无正文/工具活动时，多久判定为空转。 |
+| `maxRecoveries` | number | `0`（不限） | 连续打断上限；出现可见进展即清零。`0` = 不限次数。 |
+| `recoveryPrompt` | string | 见 `index.js` | 唤醒时注入的提示语。 |
+
+示例：
+
+```yaml
+- insert:
+    - id: loop-watchdog
+      name: 'dsh-loop-watchdog'
+      config:
+        stallMs: 60000
+        thinkingStallMs: 90000
+```
 
 ## 安装 / Install
 
 **方式一（推荐）：通过 DSH 插件管理器。**
-发布到 registry/npm 后，在 DSH 的插件管理界面搜索 `dsh-loop-watchdog` 安装即可。
-本插件不声明 `engines.dsh`、也不声明 `@deepseek-ai/dsh` peerDependencies，因此不会
-被判定 `incompatible-version`，可以正常打开。
+在 DSH 的插件管理界面安装 `dsh-loop-watchdog`（发布到 registry 后可直接搜索）。
+本插件不声明 `engines.dsh`、也不声明 `@deepseek-ai/dsh` peerDependencies，
+不会被判定 `incompatible-version`，可以正常打开。
 
-**方式二（手动）：**
+**方式二（本地目录，免打包）：**
 
-1. 把包放进 profile 依赖，例如在 profile 的 `package.json` 中加入：
+1. 把本仓库克隆到本地，在 profile 的 `package.json` 中加依赖：
 
    ```json
-   {
-     "dependencies": {
-       "dsh-loop-watchdog": "1.0.0"
-     }
-   }
+   { "dependencies": { "dsh-loop-watchdog": "link:<本仓库绝对路径>" } }
    ```
 
-2. 在 profile 的 `cordis.patch.yml` 中插入一行（或依赖包内自带的
-   `cordis.patch.yml`）：
+2. 在 profile 的 `cordis.patch.yml` 中插入包内自带的行（或直接引用
+   `cordis.patch.yml` 内容）：
 
    ```yaml
    - insert:
@@ -55,39 +88,31 @@ strategy until the task is actually done.
          config: {}
    ```
 
-## 配置 / Config
+3. 重启 DSH 或通过 HMR 生效。
 
-通过 bundle 行的 `config` 传入：
+## 工作原理 / How it works
 
-| 键 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `enabled` | boolean | `true` | 总开关，设为 `false` 即完全停用。 |
-| `stallMs` | number | `30000` | 完全无任何活动多久（毫秒）判定为死循环。 |
-| `thinkingStallMs` | number | `45000` | 只有内部思考（reasoning）而无正文/工具活动时，多久判定为空转。 |
-| `maxRecoveries` | number | `0`（不限） | 连续打断次数上限；出现可见进展即清零。`0` 表示不限次数，直到任务完成。 |
-| `recoveryPrompt` | string | 见 `index.js` | 唤醒时注入的提示语。 |
-
-## 分级检测（v1.0.2）
-
-- **可见进展**（正文流式输出、工具执行/结果、新步骤）→ 重置全部计时器与计数器。
-- **只有思考输出**（reasoning-delta 持续、无正文）→ 仅重置 `thinkingStallMs` 短计时器；
-  长时间纯思考同样会被判定空转并打断。
-- **完全静默** → `stallMs` 后打断。
-- **向用户等待（v1.0.3）**：插件提出选择题（ask_user_question）或权限审批弹窗时，
-  看门狗完全冻结，等待用户回答的时间不计入任何计时；收到答案后自动恢复检测。
-- 打断次数默认**不限**，只要任务还在跑且反复卡死，看门狗就持续介入，直到出现真实进展或回合自然结束。
+Host-only bundle：`cordis.patch.yml` 插入一行，`apply(ctx, config)` 监听
+`agent/created`，为每个 agent 在 `agent.ctx` 上注册活动/进展监听器，并在 root
+context 上按 `exec.agent` 匹配注册 `tools/*` 事件。所有定时器 `unref()`，
+不会拖住进程。
 
 ## 重要提示 / Important
 
-本插件会**主动中断** agent 的当前回合再注入唤醒消息，属于干预式工具。默认
-`stallMs=90000`（90 秒）只针对"完全没有任何输出"的极端情况，误伤概率低，但请在
-关键任务中按需调大 `stallMs` 或直接设置 `enabled: false` 关闭。
+本插件会**主动中断** agent 的当前回合再注入唤醒消息，属于干预式工具。默认阈值
+（30s / 45s）偏激进，适合"宁可错杀"的场景；关键任务中可把 `stallMs` /
+`thinkingStallMs` 调大，或直接 `enabled: false` 关闭。等待用户回答期间插件
+保证不打扰。
 
-## 设计说明 / Implementation note
+## 变更记录 / Changelog
 
-`index.js` **不导入任何裸的 `@deepseek-ai/*` 运行时包**，只使用 `node:crypto`，并
-按 DSH 的公开消息结构手工构造 follow-up 消息。这样无论从本地 `link:` 安装还是从
-registry 安装，都能被 Node 正常解析加载，避免 `ERR_MODULE_NOT_FOUND`。
+- **v1.0.3** — 向用户提问 / 权限审批等待期间冻结看门狗，该时间不计入卡顿判定。
+- **v1.0.2** — 分级检测：只有思考输出、无正文的空转同样打断（`thinkingStallMs`）；
+  `stallMs` 默认从 90s 降到 30s；打断次数默认改为不限（进展即清零）。
+- **v1.0.1** — 修复关键 bug：waterfall 监听器未返回 `next()` 导致对话报错
+  `Cannot read properties of undefined (reading 'kind')`；`tools/*` 事件改注册到
+  root context；唤醒消息补全 `source.kind`。
+- **v1.0.0** — 首个版本：静默检测 + 打断 + 唤醒继续。
 
 ## 许可证 / License
 

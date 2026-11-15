@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Loop watchdog",
-    "description": "Detects long no-output turns and breaks the dead loop so the agent keeps working until the task is done.",
-    "detail": "Watches running agent activity. If no output or tool activity arrives for the configured stall time, it cancels the stuck turn and injects a follow-up that forces a change of strategy, repeating up to a per-agent cap."
+    "description": "Detects dead-loop turns — no output, or reasoning spinning without visible results — breaks them and wakes the agent to continue until the task is done. Never interrupts while waiting for the user.",
+    "detail": "Tiered detection: streamed text and tool activity count as visible progress and reset all timers; reasoning-only output is judged against a shorter thinkingStallMs; full silence against stallMs. On a stall it cancels the stuck turn and injects a change-of-strategy follow-up, unlimited by default with the counter reset on real progress. While a question or approval dialog awaits the user, the watchdog is fully frozen."
   }
 }
