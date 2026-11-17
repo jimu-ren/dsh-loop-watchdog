@@ -125,7 +125,7 @@ export function apply(ctx, rawConfig) {
     return
   }
   log.info(
-    `loop-watchdog v1.0.4 enabled: stallMs=${config.stallMs} thinkingStallMs=${config.thinkingStallMs}`
+    `loop-watchdog v1.0.5 enabled: stallMs=${config.stallMs} thinkingStallMs=${config.thinkingStallMs}`
     + ` maxSilentThinkingMs=${config.maxSilentThinkingMs} repeatThreshold=${config.repeatThreshold}`
     + ` maxRecoveries=${config.maxRecoveries === 0 ? 'unlimited' : config.maxRecoveries}`,
   )
@@ -195,12 +195,24 @@ export function apply(ctx, rawConfig) {
       config.repeatMinSamples,
     )
     if (verdict.loop) {
+      // Confirmation strike: one high window can be a legitimately
+      // repetitive passage (e.g. checking many similar items). Two
+      // consecutive high windows confirm the spin.
+      entry.repeatStrike += 1
+      if (entry.repeatStrike < 2) {
+        log.info(
+          `agent ${String(entry.agent.id)} duplication rate high (${verdict.total - verdict.unique}/${verdict.total}); confirming next window`,
+        )
+        armThink(entry)
+        return
+      }
       fire(
         entry,
         `repetitive thinking (${verdict.total - verdict.unique}/${verdict.total} sentences are duplicates)`,
       )
       return
     }
+    entry.repeatStrike = 0
     if (entry.reasonBuf.length === 0) return // silence timer owns that case
     entry.silentThinkingBudget -= config.thinkingStallMs
     if (entry.silentThinkingBudget <= 0) {
@@ -219,6 +231,7 @@ export function apply(ctx, rawConfig) {
     const entry = entries.get(agent?.id)
     if (!entry || entry.disposed) return
     entry.reasonBuf = ''
+    entry.repeatStrike = 0
     entry.silentThinkingBudget = config.maxSilentThinkingMs
     if (entry.recoveries !== 0) {
       log.info(`agent ${String(agent.id)} produced visible output; recovery counter reset`)
@@ -271,6 +284,7 @@ export function apply(ctx, rawConfig) {
     }
     entry.recoveries += 1
     entry.reasonBuf = ''
+    entry.repeatStrike = 0
     entry.silentThinkingBudget = config.maxSilentThinkingMs
     log.warn(
       `agent ${String(agent.id)} dead loop detected (${reason}); breaking turn (break #${entry.recoveries})`,
@@ -339,6 +353,7 @@ export function apply(ctx, rawConfig) {
       thinkTimer: null,
       reasonBuf: '',
       silentThinkingBudget: config.maxSilentThinkingMs,
+      repeatStrike: 0,
       waiting: 0,
       pendingTools: 0,
       recoveries: 0,
